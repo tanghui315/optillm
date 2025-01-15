@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, TypedDict
 
 import torch
@@ -84,6 +85,9 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
         )
     except Exception as e:
         raise OSError("Failed to load tokenizer.") from e
+        
+    if model_args.model_max_length is not None and tokenizer.model_max_length != model_args.model_max_length:
+        tokenizer.model_max_length = model_args.model_max_length
 
     if model_args.new_special_tokens is not None:
         num_added_tokens = tokenizer.add_special_tokens(
@@ -202,12 +206,8 @@ def load_model(
 
     logger.info_rank0(param_stats)
 
-    if model_args.print_param_status:
+    if model_args.print_param_status and int(os.getenv("LOCAL_RANK", "0")) == 0:
         for name, param in model.named_parameters():
-            print(
-                "name: {}, dtype: {}, device: {}, trainable: {}".format(
-                    name, param.dtype, param.device, param.requires_grad
-                )
-            )
+            print(f"name: {name}, dtype: {param.dtype}, device: {param.device}, trainable: {param.requires_grad}")
 
     return model

@@ -11,8 +11,7 @@ fsdp_config:
   fsdp_sharding_strategy: FULL_SHARD
   fsdp_state_dict_type: FULL_STATE_DICT
   fsdp_sync_module_states: true
-  fsdp_use_orig_params: true
-  fsdp_activation_checkpointing: true
+  fsdp_use_orig_params: false
 machine_rank: 0
 main_training_function: main
 mixed_precision: bf16
@@ -23,4 +22,3 @@ same_network: true
 tpu_env: []
 tpu_use_cluster: false
 tpu_use_sudo: false
-use_cpu: false

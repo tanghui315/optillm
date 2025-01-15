@@ -41,6 +41,26 @@ class DataArguments:
         default="data",
         metadata={"help": "Path to the folder containing the datasets."},
     )
+    
+    sft_dataset: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The name of dataset(s) to use for training. Use commas to separate multiple datasets."},
+    )
+    sft_dataset_dir: str = field(
+        default="data",
+        metadata={"help": "Path to the folder containing the datasets."},
+    )
+    pt_dataset: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The name of dataset(s) to use for training. Use commas to separate multiple datasets."},
+    )
+    pt_dataset_dir: str = field(
+        default="data",
+        metadata={"help": "Path to the folder containing the datasets."},
+    )
+    
     image_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the folder containing the images or videos. Defaults to `dataset_dir`."},

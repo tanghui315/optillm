@@ -1,0 +1,12 @@
+DISABLE_VERSION_CHECK=1 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file ./fsdp_config.yaml   ./train.py \
+ --stage mix     --do_train     --model_name_or_path /home/ubuntu/cjr/models/LLM-Research/Codestral-22B-v0___1  \
+ --dataset 'instruction,multiround' --dataset_dir /home/ubuntu/cjr/data/v4 \
+ --sft_dataset 'instruction,multiround' --sft_dataset_dir /home/ubuntu/cjr/data/v4 \
+ --pt_dataset 'code_fim' --pt_dataset_dir /home/ubuntu/cjr/data/codefim-v4 \
+ --template mistral     --finetuning_type lora    \
+ --lora_rank 16     --lora_alpha 32  --use_rslora True  --loraplus_lr_ratio 10.0 --lora_dropout 0.05  --lora_target all \
+ --output_dir ./sft_outputs    --use_adam_mini True     --overwrite_cache  \
+ --overwrite_output_dir     --cutoff_len 8192     --flash_attn fa2     --preprocessing_num_workers 16   \
+ --per_device_train_batch_size 1     --per_device_eval_batch_size 1     --gradient_accumulation_steps 1     --lr_scheduler_type cosine     --logging_steps 10     --warmup_ratio 0.1    \
+ --save_steps 500     --eval_steps 100     --max_grad_norm 1.0     --eval_strategy steps     --load_best_model_at_end     --quantization_bit 4     --quantization_method bitsandbytes  \
+ --learning_rate 1e-5     --num_train_epochs 2.0     --val_size 0.05     --ddp_timeout 180000000     --plot_loss     --bf16

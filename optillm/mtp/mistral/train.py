@@ -17,6 +17,7 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from llamafactory.data import get_dataset, split_dataset
 from transformers import TrainingArguments
 from llamafactory.data.template import get_template_and_fix_tokenizer
+from llamafactory.extras.misc import get_current_device
 from llamafactory.hparams import DataArguments
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.trainer_pt_utils import get_parameter_names
@@ -220,14 +221,10 @@ class MixedDataCollator:
         batch = {}
         if pt_features:
             pt_batch = self.pt_collator(pt_features)
-            # pt_batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
-            #            for k, v in pt_batch.items()}
             batch.update(pt_batch)
 
         if sft_features:
             sft_batch = self.sft_collator(sft_features)
-            # sft_batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
-            #             for k, v in sft_batch.items()}
             batch.update(sft_batch)
         # 确保batch中包含所有必要的字段
         # if "attention_mask" not in batch:
@@ -350,7 +347,7 @@ def build_model(model_args, training_args, checkpoint_dir):
         config=config,
         quantization_config=quantization_config,
         torch_dtype=target_dtype,
-        # device_map="auto",  # 让模型自动处理设备分配
+        device_map=model_args.device_map,
         offload_folder="offload",  # 设置模型权重卸载目录
         offload_state_dict=True,  # 启用状态字典卸载
         # torch_dtype="auto",  # 自动选择数据类型
@@ -600,7 +597,8 @@ def train():
     data_modules = get_mixed_dataset(
         template, model_args, data_args, training_args, **tokenizer_module)
     # data_modules = split_dataset(dataset, data_args, training_args)
-
+    model_args.device_map = {"": get_current_device()}
+    model_args.model_max_length = data_args.cutoff_len
     model, optimizer = build_model(
         model_args, training_args, resume_from_checkpoint_dir)
     # 使用MixedDataCollator
