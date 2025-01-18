@@ -8,5 +8,5 @@ DISABLE_VERSION_CHECK=1 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_
  --output_dir ./sft_outputs    --use_adam_mini True     --overwrite_cache  \
  --overwrite_output_dir     --cutoff_len 8192     --flash_attn fa2     --preprocessing_num_workers 16   \
  --per_device_train_batch_size 1     --per_device_eval_batch_size 1     --gradient_accumulation_steps 1     --lr_scheduler_type cosine     --logging_steps 10     --warmup_ratio 0.1    \
- --save_steps 500     --eval_steps 100     --max_grad_norm 1.0     --eval_strategy steps     --load_best_model_at_end     --quantization_bit 4     --quantization_method bitsandbytes  \
+ --save_steps 500     --eval_steps 100     --max_grad_norm 1.0     --eval_strategy steps     --load_best_model_at_end    \
  --learning_rate 1e-5     --num_train_epochs 2.0     --val_size 0.05     --ddp_timeout 180000000     --plot_loss     --bf16

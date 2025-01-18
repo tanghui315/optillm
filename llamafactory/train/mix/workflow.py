@@ -17,7 +17,7 @@
 
 import copy
 import os
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -44,6 +44,7 @@ from .trainer import MixedTrainer
 from transformers import AutoModelForCausalLM,DataCollatorForLanguageModeling, DataCollatorForSeq2Seq
 import datasets
 import time
+from dataclasses import dataclass
 if TYPE_CHECKING:
     from transformers import Seq2SeqTrainingArguments, TrainerCallback
 
@@ -52,61 +53,60 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-class MixedDataCollator:
-    def __init__(self, tokenizer, model=None, **kwargs):
-        self.tokenizer = tokenizer
+@dataclass
+class MixedDataCollator(DataCollatorForSeq2Seq):
+    def __init__(
+        self, 
+        model=None,
+        pad_to_multiple_of=None,  # for shift short attention
+        label_pad_token_id=None,
+        block_diag_attn=False,
+        attn_implementation=None,
+        compute_dtype=None,
+        tokenizer=None
+    ):
+        super().__init__(
+            model=model,
+            pad_to_multiple_of=pad_to_multiple_of,
+            label_pad_token_id=label_pad_token_id,
+            tokenizer=tokenizer,
+            padding=True,
+        )
         self.pt_collator = DataCollatorForLanguageModeling(
             tokenizer=tokenizer,
             mlm=False
         )
-        self.sft_collator = DataCollatorForSeq2Seq(
-            tokenizer=tokenizer,
-            model=model,
-            label_pad_token_id=kwargs.get('label_pad_token_id', -100)
-        )
-        self.debug_count = 0
-        logger.info("MixedDataCollator initialized")
 
-    def __call__(self, features):
-        logger.info(f"Processing batch with {len(features)} features")
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # 过滤掉不需要的字段
+        filtered_features = []
         
-        pt_features = []
-        sft_features = []
-
+        # 先检查是否为 PT 数据
+        is_pt = features and features[0].get("is_pt", False)
+        
+        # 根据数据类型选择需要保留的字段
+        if is_pt:
+            # PT 数据只需要 input_ids 和 attention_mask
+            needed_keys = {'input_ids', 'attention_mask'}
+        else:
+            # SFT 数据需要 input_ids, attention_mask 和 labels
+            needed_keys = {'input_ids', 'attention_mask', 'labels'}
+        
         for feature in features:
-            if feature.get("is_pt", False):
-                # 确保数据格式正确
-                pt_feature = {
-                    "input_ids": feature["input_ids"],
-                    "attention_mask": feature["attention_mask"],
-                    "labels": feature["input_ids"].copy() if "labels" not in feature else feature["labels"]
-                }
-                pt_features.append(pt_feature)
-            else:
-                sft_features.append(feature)
+            filtered_feature = {k: v for k, v in feature.items() if k in needed_keys}
+            filtered_features.append(filtered_feature)
 
-        logger.info(f"Split into {len(pt_features)} PT and {len(sft_features)} SFT features")
-
-        batch = {}
-        if pt_features:
-            try:
-                pt_batch = self.pt_collator(pt_features)
-                # 只在前几个 batch 或出错时打印调试信息
-                if self.debug_count < 3:  # 只打印前3个batch
-                    print("PT batch keys:", pt_batch.keys())
-                    print("PT batch shapes:", {k: v.shape for k, v in pt_batch.items()})
-                    self.debug_count += 1
-                batch.update(pt_batch)
-            except Exception as e:
-                print("Error in PT collation:", e)
-                print("PT features:", pt_features[0].keys())
-                raise e
-
-        if sft_features:
-            sft_batch = self.sft_collator(sft_features)
-            batch.update(sft_batch)
-
-        return batch
+        # 根据之前保存的 is_pt 标记来决定使用哪个 collator
+        if is_pt:
+            # if filtered_features and len(filtered_features) > 0:
+            #     logger.info_rank0(f"PT Sample feature keys: {list(filtered_features[0].keys())}")
+            # PT数据只需要input_ids，DataCollatorForLanguageModeling会自动处理labels
+            return self.pt_collator.torch_call(filtered_features)
+        else:
+            # if filtered_features and len(filtered_features) > 0:
+            #     logger.info_rank0(f"SFT Sample feature keys: {list(filtered_features[0].keys())}")
+            # SFT数据使用父类处理
+            return super().__call__(filtered_features)
 
 
 def get_mixed_dataset(template, model_args, data_args, training_args, **kwargs):
@@ -135,11 +135,18 @@ def get_mixed_dataset(template, model_args, data_args, training_args, **kwargs):
 
     # 为数据集添加标识
     for split in sft_dataset:
+        logger.info_rank0(f"SFT dataset '{split}' columns before mapping: {sft_dataset[split].column_names}")   
+        # 只删除 images 和 videos 列
+        # columns_to_remove = ['images', 'videos']
         sft_dataset[split] = sft_dataset[split].map(
-            lambda x: {**x, "is_pt": False}
+            lambda x: {**x, "is_pt": False},
+            # remove_columns=columns_to_remove
         )
+        # 添加验证代码
+        logger.info_rank0(f"SFT dataset '{split}' columns after mapping: {sft_dataset[split].column_names}")
 
     for split in pt_dataset:
+        logger.info_rank0(f"PT dataset '{split}' columns before mapping: {pt_dataset[split].column_names}")
         pt_dataset[split] = pt_dataset[split].map(
             lambda x: {**x, "is_pt": True}
         )
@@ -215,25 +222,24 @@ def load_mtp_model(
             model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
         else:
             model = load_class.from_pretrained(**init_kwargs)
-
+            
+        # # 确保模型在正确的设备上
+        # if torch.cuda.is_available():
+        #     model = model.cuda()
+            
         logger.info_rank0("Model loading completed successfully")
 
     if not lazy_load:
-        # 在应用 LoRA 之前，先解冻 lm_head 和 future_lm_heads
-        if is_trainable and finetuning_args.finetuning_type == "lora":
-            # 解冻 lm_head
-            if hasattr(model, "lm_head"):
-                model.lm_head.requires_grad_(True)
-            # 解冻 future_lm_heads
-            if hasattr(model, "future_lm_heads"):
-                for head in model.future_lm_heads:
-                    head.requires_grad_(True)
-
         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)
         register_autoclass(config, model, tokenizer)
 
+    
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
-
+    
+    if is_trainable and hasattr(model, "future_lm_heads"):
+        for head in model.future_lm_heads:
+            head.requires_grad_(True)
+    
     if not is_trainable:
         model.requires_grad_(False)
         for param in model.parameters():
@@ -256,7 +262,9 @@ def load_mtp_model(
     if model_args.print_param_status and int(os.getenv("LOCAL_RANK", "0")) == 0:
         for name, param in model.named_parameters():
             print(f"name: {name}, dtype: {param.dtype}, device: {param.device}, trainable: {param.requires_grad}")
-
+    # 输出 model_args.compute_dtype
+    logger.info_rank0(f"model_args.compute_dtype: {model_args.compute_dtype}")
+    
     return model
 
 
@@ -281,10 +289,19 @@ def run_mixed(
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
 
+    # data_collator = MixedDataCollator(
+    #     tokenizer=tokenizer,
+    #     model=model if not training_args.predict_with_generate else None,
+    #     label_pad_token_id=IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
+    # )
     data_collator = MixedDataCollator(
-        tokenizer=tokenizer,
         model=model if not training_args.predict_with_generate else None,
+        pad_to_multiple_of=8 if training_args.do_train else None,  # for shift short attention
         label_pad_token_id=IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
+        block_diag_attn=model_args.block_diag_attn,
+        attn_implementation=getattr(model.config, "_attn_implementation", None),
+        compute_dtype=model_args.compute_dtype,
+        tokenizer=tokenizer,
     )
     logger.info(f"Created data collator: {data_collator}")
 

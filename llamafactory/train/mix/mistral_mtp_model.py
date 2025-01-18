@@ -180,6 +180,7 @@ class MistralMTPForCausalLM(MistralForCausalLM):
             ])
             for head in self.future_lm_heads:
                 head.weight.data.copy_(self.lm_head.weight.data)
+                # head.requires_grad_(True)  # 设置为可训练
     
     # 添加这个方法来帮助 PEFT 找到正确的层
     def get_decoder(self):
@@ -236,7 +237,10 @@ class MistralMTPForCausalLM(MistralForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         outputs = self.model(input_ids, attention_mask=attention_mask, **kwargs)
-        hidden_states = outputs[0]  # [batch, n_future_tokens, seq_len, hidden_size]
+        hidden_states = outputs[0]  # [batch, seq_len, n_future_tokens, hidden_size]
+        
+        # 调整维度顺序
+        hidden_states = hidden_states.transpose(1, 2)  # [batch, n_future_tokens, seq_len, hidden_size]
         
         # MTP模式的logits计算
         logits = []
@@ -245,42 +249,45 @@ class MistralMTPForCausalLM(MistralForCausalLM):
             step_logits = self.future_lm_heads[i](step_hidden)
             logits.append(step_logits)
         logits = torch.stack(logits, dim=1)  # [batch, n_future_tokens, seq_len, vocab_size]
+        # logger.info(f"stacked logits shape: {logits.shape}")
 
         loss = None
         if labels is not None:
-            # 转换为float32以避免精度问题
-            logits_float = logits.float()
+            # 确保使用正确的数据类型
+            logits_float = logits.to(dtype=self.config.torch_dtype)
             
-            # 准备多步预测的标签
-            shifted_labels = labels[:, 1:]  # 移除第一个token
-            future_labels = []
-            for i in range(self.model.n_future_tokens):
-                # 对每个预测步长,取对应位置的标签
-                step_labels = shifted_labels[:, i:i+shifted_labels.size(1)-self.model.n_future_tokens+1]
-                future_labels.append(step_labels)
-            future_labels = torch.stack(future_labels, dim=1)  # [batch_size, n_future_tokens, seq_len]
-            
-            # 计算每个预测头的loss
             loss_fct = CrossEntropyLoss()
             losses = []
+            
             for i in range(self.model.n_future_tokens):
-                step_logits = logits_float[:, i]  # [batch_size, seq_len, vocab_size]
-                step_labels = future_labels[:, i]  # [batch_size, seq_len]
+                # 获取当前预测头的 logits
+                step_logits = logits_float[:, i]  # [batch, seq_len, vocab_size]
                 
-                # 重塑logits以匹配CrossEntropyLoss期望的形状
-                shift_logits = step_logits[..., :-1, :].contiguous()
-                shift_labels = step_labels[..., 1:].contiguous()
+                # 对于第 i 个预测头，预测位置 t+i+1 的 token
+                # 例如：对于序列 [A, B, C, D]
+                # i=0: 输入[A], 预测B
+                # i=1: 输入[A,B], 预测C
+                input_tokens = labels[:, :-i-1]  # 输入序列，去掉最后 i+1 个token
+                target_tokens = labels[:, i+1:]  # 目标序列，从第 i+1 个token开始
                 
-                # 计算这一步的loss
-                step_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), 
-                                   shift_labels.view(-1))
+                # 确保序列长度匹配
+                curr_seq_len = min(input_tokens.size(1), step_logits.size(1))
+                curr_logits = step_logits[:, :curr_seq_len, :]  # [batch, curr_seq_len, vocab_size]
+                curr_targets = target_tokens[:, :curr_seq_len]  # [batch, curr_seq_len]
+                
+                # 计算 loss
+                step_loss = loss_fct(
+                    curr_logits.reshape(-1, curr_logits.size(-1)),  # [batch*curr_seq_len, vocab_size]
+                    curr_targets.reshape(-1)  # [batch*curr_seq_len]
+                )
+                step_loss = step_loss.mean()
                 losses.append(step_loss)
             
-            # 合并所有预测头的loss，使用加权平均
-            weights = torch.tensor([1/(i+1) for i in range(self.model.n_future_tokens)], 
-                                 device=losses[0].device)
-            weights = weights / weights.sum()  # 归一化权重
-            loss = torch.stack(losses) @ weights  # 加权求和
+            if len(losses) > 0:
+                # 使用指数衰减的权重
+                weights = torch.exp(-torch.arange(len(losses), device=losses[0].device) * 0.5)
+                weights = weights / weights.sum()
+                loss = torch.stack(losses) @ weights
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -290,68 +297,63 @@ class MistralMTPForCausalLM(MistralForCausalLM):
             attentions=outputs.attentions,
         )
 
-    @classmethod
-    def _load_pretrained_model(
-        cls,
-        model,
-        state_dict,
-        loaded_keys,
-        resolved_archive_file,
-        pretrained_model_name_or_path,
-        ignore_mismatched_sizes=False,
-        sharded_metadata=None,
-        _fast_init=True,
-        low_cpu_mem_usage=False,
-        device_map=None,
-        offload_folder=None,
-        offload_state_dict=None,
-        dtype=None,
-        hf_quantizer=None,
-        keep_in_fp32_modules=None,
-        gguf_path=None,
-        weights_only=True,
-    ):
-        """重写父类的 _load_pretrained_model 方法，确保参数完整"""
+    # @classmethod
+    # def _load_pretrained_model(
+    #     cls,
+    #     model,
+    #     state_dict,
+    #     loaded_keys,
+    #     resolved_archive_file,
+    #     pretrained_model_name_or_path,
+    #     ignore_mismatched_sizes=False,
+    #     sharded_metadata=None,
+    #     _fast_init=True,
+    #     low_cpu_mem_usage=False,
+    #     device_map=None,
+    #     offload_folder=None,
+    #     offload_state_dict=None,
+    #     dtype=None,
+    #     hf_quantizer=None,
+    #     keep_in_fp32_modules=None,
+    #     gguf_path=None,
+    #     weights_only=True,
+    # ):
+    #     """重写父类的 _load_pretrained_model 方法，使用标准初始化方法"""
         
-        # 处理新增的 future_lm_heads
-        if getattr(model.config, "n_future_tokens", 1) > 1:
-            # 确保 state_dict 存在
-            if state_dict is None:
-                state_dict = {}
-                logger.warning_rank0("state_dict is None, initializing an empty one")
+    #     # 处理新增的 future_lm_heads
+    #     if getattr(model.config, "n_future_tokens", 1) > 1:
+    #         # 使用 nn.ModuleList 创建多个预测头
+    #         model.future_lm_heads = nn.ModuleList([
+    #             type(model.lm_head)(model.config.hidden_size, model.config.vocab_size)
+    #             for _ in range(model.config.n_future_tokens)
+    #         ])
             
-            for i in range(model.config.n_future_tokens):
-                key = f"future_lm_heads.{i}.weight"
-                # 只有当 key 不存在时才进行初始化
-                if key not in state_dict:
-                    if "lm_head.weight" in state_dict:
-                        # 使用原始 lm_head 的权重初始化
-                        logger.info_rank0(f"Initializing {key} with lm_head weights")
-                        state_dict[key] = state_dict["lm_head.weight"].clone()
-                    else:
-                        logger.warning_rank0(f"Cannot find lm_head.weight to initialize {key}")
-                    if loaded_keys is not None:  # 也要检查 loaded_keys
-                        loaded_keys.append(key)
-                else:
-                    logger.info_rank0(f"Found existing weights for {key}")
+    #         # 使用 Kaiming 初始化
+    #         for head in model.future_lm_heads:
+    #             nn.init.kaiming_normal_(
+    #                 head.weight,
+    #                 mode='fan_out',
+    #                 nonlinearity='linear'
+    #             )
+    #             logger.info_rank0(f"Initialized future_lm_head with Kaiming initialization")
         
-        # 调用父类的加载方法
-        return super()._load_pretrained_model(
-            model=model,
-            state_dict=state_dict,
-            loaded_keys=loaded_keys,
-            resolved_archive_file=resolved_archive_file,
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            ignore_mismatched_sizes=ignore_mismatched_sizes,
-            sharded_metadata=sharded_metadata,
-            _fast_init=_fast_init,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-            device_map=device_map,
-            offload_folder=offload_folder,
-            offload_state_dict=offload_state_dict,
-            dtype=dtype,
-            hf_quantizer=hf_quantizer,
-            keep_in_fp32_modules=keep_in_fp32_modules,
-            gguf_path=gguf_path,
-            weights_only=weights_only,
-        )
+    #     # 调用父类的加载方法
+    #     return super()._load_pretrained_model(
+    #         model=model,
+    #         state_dict=state_dict,
+    #         loaded_keys=loaded_keys,
+    #         resolved_archive_file=resolved_archive_file,
+    #         pretrained_model_name_or_path=pretrained_model_name_or_path,
+    #         ignore_mismatched_sizes=ignore_mismatched_sizes,
+    #         sharded_metadata=sharded_metadata,
+    #         _fast_init=_fast_init,
+    #         low_cpu_mem_usage=low_cpu_mem_usage,
+    #         device_map=device_map,
+    #         offload_folder=offload_folder,
+    #         offload_state_dict=offload_state_dict,
+    #         dtype=dtype,
+    #         hf_quantizer=hf_quantizer,
+    #         keep_in_fp32_modules=keep_in_fp32_modules,
+    #         gguf_path=gguf_path,
+    #         weights_only=weights_only,
+    #     )

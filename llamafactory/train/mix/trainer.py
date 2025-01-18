@@ -60,11 +60,6 @@ class MixedTrainer(Trainer):
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
 
-        # if finetuning_args.use_badam:
-        #     from badam import BAdamCallback, clip_grad_norm_old_version
-        #     self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
-        #     self.add_callback(BAdamCallback)
-
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -133,3 +128,17 @@ class MixedTrainer(Trainer):
         with open(output_prediction_file, "w", encoding="utf-8") as f:
             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+
+    # def training_step(self, *args, **kwargs):
+    #     loss = super().training_step(*args, **kwargs)
+        
+    #     # 检查梯度
+    #     for name, param in self.model.named_parameters():
+    #         if param.requires_grad:
+    #             grad = param.grad
+    #             if grad is not None:
+    #                 logger.info_rank0(f"{name} grad norm: {grad.norm().item():.4f}")
+    #             else:
+    #                 logger.warning_rank0(f"{name} has no gradient")
+        
+    #     return loss
