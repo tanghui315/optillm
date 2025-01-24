@@ -236,9 +236,13 @@ def load_mtp_model(
     
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
     
-    if is_trainable and hasattr(model, "future_lm_heads"):
-        for head in model.future_lm_heads:
-            head.requires_grad_(True)
+    if is_trainable:
+        if hasattr(model.model, "mtp_modules"):
+            for module in model.model.mtp_modules:
+                # 确保 projection 和 transformer 都是可训练的
+                module['projection'].requires_grad_(True)
+                module['transformer'].requires_grad_(True)
+                logger.info_rank0(f"Set projection and transformer to trainable")
     
     if not is_trainable:
         model.requires_grad_(False)
@@ -289,11 +293,6 @@ def run_mixed(
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
 
-    # data_collator = MixedDataCollator(
-    #     tokenizer=tokenizer,
-    #     model=model if not training_args.predict_with_generate else None,
-    #     label_pad_token_id=IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
-    # )
     data_collator = MixedDataCollator(
         model=model if not training_args.predict_with_generate else None,
         pad_to_multiple_of=8 if training_args.do_train else None,  # for shift short attention
