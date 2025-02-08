@@ -39,6 +39,7 @@ logger = logging.get_logger(__name__)
 @dataclass
 class Template:
     format_user: "Formatter"
+    format_fim: "Formatter"
     format_assistant: "Formatter"
     format_system: "Formatter"
     format_function: "Formatter"
@@ -187,7 +188,12 @@ class Llama2Template(Template):
                     system_text = self.format_system.apply(content=(system + tool_text))[0]
 
             if message["role"] == Role.USER.value:
-                elements += self.format_user.apply(content=system_text + message["content"])
+                if "[MIDDLE]" in message["content"]:
+                    elements += self.format_fim.apply(content=message["content"])
+                    logger.info_rank0(f"FIM: {elements}")
+                    exit()
+                else:
+                    elements += self.format_user.apply(content=system_text + message["content"])
             elif message["role"] == Role.ASSISTANT.value:
                 elements += self.format_assistant.apply(content=message["content"])
             elif message["role"] == Role.OBSERVATION.value:
@@ -208,6 +214,7 @@ TEMPLATES: Dict[str, "Template"] = {}
 def _register_template(
     name: str,
     format_user: Optional["Formatter"] = None,
+    format_fim: Optional["Formatter"] = None,
     format_assistant: Optional["Formatter"] = None,
     format_system: Optional["Formatter"] = None,
     format_function: Optional["Formatter"] = None,
@@ -245,12 +252,14 @@ def _register_template(
     template_class = Llama2Template if any(k in name for k in ("llama2", "mistral", "pixtral")) else Template
     default_slots = ["{{content}}"] if efficient_eos else ["{{content}}", {"eos_token"}]
     default_user_formatter = StringFormatter(slots=["{{content}}"])
+    default_fim_formatter = StringFormatter(slots=["{{content}}"])
     default_assistant_formatter = StringFormatter(slots=default_slots)
     default_function_formatter = FunctionFormatter(slots=default_slots, tool_format="default")
     default_tool_formatter = ToolFormatter(tool_format="default")
     default_prefix_formatter = EmptyFormatter()
     TEMPLATES[name] = template_class(
         format_user=format_user or default_user_formatter,
+        format_fim=format_fim or default_fim_formatter,
         format_assistant=format_assistant or default_assistant_formatter,
         format_system=format_system or default_user_formatter,
         format_function=format_function or default_function_formatter,
@@ -967,6 +976,7 @@ _register_template(
 _register_template(
     name="mistral",
     format_user=StringFormatter(slots=["[INST] {{content}}[/INST]"]),
+    format_fim=StringFormatter(slots=["{{content}}"]),
     format_assistant=StringFormatter(slots=[" {{content}}", {"eos_token"}]),
     format_system=StringFormatter(slots=["{{content}}\n\n"]),
     format_function=FunctionFormatter(slots=["[TOOL_CALLS] ", "{{content}}", {"eos_token"}], tool_format="mistral"),
