@@ -2,7 +2,7 @@ from typing import Optional, Union, Tuple, List
 import torch
 import torch.nn as nn
 from transformers.models.mistral.modeling_mistral import MistralModel, MistralForCausalLM, MistralDecoderLayer
-from transformers.cache_utils import Cache,DynamicCache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.utils import logging
 from torch.nn import CrossEntropyLoss
@@ -190,7 +190,7 @@ class MistralMTPModel(MistralModel):
                         hidden_states,
                         attention_mask=causal_mask,
                         position_ids=position_ids,
-                        past_key_value=None if not use_cache else past_key_values,
+                        past_key_value=past_key_values if (use_cache and isinstance(past_key_values, (Cache, DynamicCache))) else None,
                         output_attentions=output_attentions,
                         use_cache=use_cache,
                         cache_position=cache_position,
@@ -211,11 +211,17 @@ class MistralMTPModel(MistralModel):
                 # 添加调试信息
                 print(f"[Layer {i}/{len(self.layers)-1}] After decoder_layer:")
                 print(f"  - output shape: {layer_outputs[0].shape}")
-                if past_key_values is not None and i in past_key_values.key_cache:
-                    key = past_key_values.key_cache[i]
-                    value = past_key_values.value_cache[i]
-                    print(f"  - updated key shape: {key.shape if key is not None else None}")
-                    print(f"  - updated value shape: {value.shape if value is not None else None}")
+                if past_key_values is not None:
+                    try:
+                        if isinstance(past_key_values, (Cache, DynamicCache)):
+                            key_cache = past_key_values.key_cache
+                            if isinstance(key_cache, dict) and i in key_cache:
+                                key = past_key_values.key_cache[i]
+                                value = past_key_values.value_cache[i]
+                                print(f"  - updated key shape: {key.shape if key is not None else None}")
+                                print(f"  - updated value shape: {value.shape if value is not None else None}")
+                    except Exception as e:
+                        print(f"Warning: Error checking cache for MTP module {i}: {str(e)}")
             
             # 通过预测头
             latents = []
@@ -319,19 +325,26 @@ class MistralMTPModel(MistralModel):
                 print(f"\n[MTP Module {i}] Before transformer:")
                 print(f"  - projected shape: {projected.shape}")
                 print(f"  - use_cache: {use_cache}")
+
+                # 检查缓存状态
+                layer_idx = len(self.layers) + i  # 计算MTP模块的层索引
                 if past_key_values is not None:
-                    layer_idx = len(self.layers) + i
-                    if layer_idx in past_key_values.key_cache:
-                        key = past_key_values.key_cache[layer_idx]
-                        value = past_key_values.value_cache[layer_idx]
-                        print(f"  - key shape: {key.shape if key is not None else None}")
-                        print(f"  - value shape: {value.shape if value is not None else None}")
+                    try:
+                        if isinstance(past_key_values, (Cache, DynamicCache)):
+                            key_cache = past_key_values.key_cache
+                            if isinstance(key_cache, dict) and layer_idx in key_cache:
+                                key = key_cache[layer_idx]
+                                value = past_key_values.value_cache[layer_idx]
+                                print(f"  - key shape: {key.shape if key is not None else None}")
+                                print(f"  - value shape: {value.shape if value is not None else None}")
+                    except Exception as e:
+                        print(f"Warning: Error checking cache for MTP module {i}: {str(e)}")
 
                 transformer_output = mtp_module['transformer'](
                     projected,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
-                    past_key_value=None if not use_cache else past_key_values,  # 当 use_cache=False 时不使用缓存
+                    past_key_value=past_key_values if (use_cache and isinstance(past_key_values, (Cache, DynamicCache))) else None,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -347,11 +360,17 @@ class MistralMTPModel(MistralModel):
                 print(f"  - output shape: {transformer_output[0].shape}")
                 if past_key_values is not None:
                     layer_idx = len(self.layers) + i
-                    if layer_idx in past_key_values.key_cache:
-                        key = past_key_values.key_cache[layer_idx]
-                        value = past_key_values.value_cache[layer_idx]
-                        print(f"  - updated key shape: {key.shape if key is not None else None}")
-                        print(f"  - updated value shape: {value.shape if value is not None else None}")
+                    if past_key_values is not None:
+                        try:
+                            if isinstance(past_key_values, (Cache, DynamicCache)):
+                                key_cache = past_key_values.key_cache
+                                if isinstance(key_cache, dict) and layer_idx in key_cache:
+                                    key = past_key_values.key_cache[layer_idx]
+                                    value = past_key_values.value_cache[layer_idx]
+                                    print(f"  - updated key shape: {key.shape if key is not None else None}")
+                                    print(f"  - updated value shape: {value.shape if value is not None else None}")
+                        except Exception as e:
+                            print(f"Warning: Error checking cache for MTP module {i}: {str(e)}")
                 
                 prev_output = transformer_output[0]
                 output = self.norm(transformer_output[0])
@@ -493,48 +512,29 @@ class MistralMTPForCausalLM(MistralForCausalLM):
 
         loss = None
         if labels is not None:
-            logits_float = logits.to(dtype=self.config.torch_dtype)
-            loss_fct = CrossEntropyLoss()
+            logits = logits.to(dtype=self.config.torch_dtype)
+            loss_fct = CrossEntropyLoss(ignore_index=-100)  # 在这里指定ignore_index
             losses = []
             
             # 计算所有模块的 loss（包括原始模型）
             for i in range(self.model.n_future_tokens + 1):
-                step_logits = logits_float[:, i]
+                # 所有预测头都预测t+1位置，但基于不同输入
+                pred_logits = logits[:, i, :-(i+1)]  # 预测长度递减
+                targets = labels[:, (i+1):]          # 目标始终是下一个token
+                # 统一掩码：前i+1个位置无效
+                mask = torch.zeros_like(targets, dtype=torch.bool)
+                mask[:, :i] = True 
+                mask |= (targets == -100)
+                targets = targets.masked_fill(mask, -100)
                 
-                # 检查step_logits是否有NaN
-                if torch.isnan(step_logits).any():
-                    print(f"\n[Warning] Found NaN in step_logits before masking for step {i}")
-                    print(f"- step_logits shape: {step_logits.shape}")
-                    print(f"- step_logits stats before masking:")
-                    print(f"  * min={step_logits.min().item() if not torch.isnan(step_logits.min()) else 'nan'}")
-                    print(f"  * max={step_logits.max().item() if not torch.isnan(step_logits.max()) else 'nan'}")
-                    print(f"  * mean={step_logits.mean().item() if not torch.isnan(step_logits.mean()) else 'nan'}")
-                    print(f"  * % of NaN: {torch.isnan(step_logits).float().mean().item() * 100:.2f}%")
+                # 在损失计算前添加有效性检查
+                valid_targets = (targets != -100).sum()
+                if valid_targets == 0:
+                    print(f"跳过预测头 {i}，无有效目标")
+                    continue  # 跳过当前预测头的损失计算
                 
-                target_tokens = labels.clone()
-                
-                print(f"\n[Debug] Loss computation step {i}:")
-                print(f"- step_logits stats: min={step_logits.min().item():.4f}, max={step_logits.max().item():.4f}, mean={step_logits.mean().item():.4f}")
-                print(f"- target_tokens unique values: {torch.unique(target_tokens).tolist()}")
-                
-                # 对于每个模块，预测不同的未来位置
-                if i == 0:
-                    # Main Module: 预测t+1
-                    target_tokens[:, 0] = -100  # 不预测第一个token
-                else:
-                    # MTP模块: MTP1预测t+2, MTP2预测t+3
-                    # 将前i+1个位置设为-100，这样:
-                    # MTP1 (i=1): 从位置2开始预测
-                    # MTP2 (i=2): 从位置3开始预测
-                    target_tokens[:, :i+1] = -100
-                
-                print(f"After masking:")
-                valid_targets = torch.sum(target_tokens != -100)
-                print(f"- valid targets (not -100): {valid_targets.item()}")
-                print(f"- target_tokens sample: {target_tokens[0, :10].tolist()}")
-                
-                reshaped_logits = step_logits.reshape(-1, step_logits.size(-1))
-                reshaped_targets = target_tokens.reshape(-1)
+                reshaped_logits = pred_logits.reshape(-1, pred_logits.size(-1))
+                reshaped_targets = targets.reshape(-1)
                 
                 # 检查logits是否有异常值
                 print(f"Reshaped logits stats:")
@@ -544,7 +544,7 @@ class MistralMTPForCausalLM(MistralForCausalLM):
                 print(f"- has_inf: {torch.isinf(reshaped_logits).any().item()}")
                 
                 # 使用梯度裁剪来防止梯度爆炸
-                step_logits = torch.clamp(step_logits, min=-100, max=100)
+                pred_logits = torch.clamp(pred_logits, min=-100, max=100)
                 
                 step_loss = loss_fct(
                     reshaped_logits,
