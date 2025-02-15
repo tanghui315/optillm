@@ -2,7 +2,7 @@ import os
 from typing import Optional, Union, Tuple, List
 import torch
 import torch.nn as nn
-from transformers.models.mistral.modeling_mistral import MistralModel, MistralForCausalLM, MistralDecoderLayer
+from transformers.models.mistral.modeling_mistral import MistralModel, MistralForCausalLM, MistralDecoderLayer, MistralRMSNorm
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from torch.nn import CrossEntropyLoss
@@ -29,45 +29,43 @@ class MistralMTPModel(MistralModel):
         self.n_future_tokens = getattr(config, "n_future_tokens", 1)  # 默认为1，兼容原始模型
         
         if self.n_future_tokens > 1:
-            # 创建独立的MTP模块，并确保每个transformer有唯一的layer_idx
-            base_idx = len(self.layers)  # 基础模型的层数
             self.mtp_modules = nn.ModuleList([
                 nn.ModuleDict({
-                    'projection': nn.Linear(config.hidden_size * 2, config.hidden_size),
-                    'proj_act': nn.GELU(),
-                    'pre_transformer_norm': nn.LayerNorm(config.hidden_size),
-                    'transformer': MistralDecoderLayer(config, base_idx + i)
+                    'projection':nn.Linear(config.hidden_size * 2, config.hidden_size),  # 使用自定义模块
+                    'pro_norm': MistralRMSNorm(config.hidden_size, eps=1e-5),
+                    'transformer': MistralDecoderLayer(config, len(self.layers) + i)
                 }) for i in range(self.n_future_tokens)
             ])
+        #self.post_init()
+            # 调用 _init_mtp_module 对每个 MTP 模块进行初始化，确保与原模型一致
+            for module in self.mtp_modules:
+                self._init_mtp_module(module, config)
             
-            # 初始化MTP模块
-            for mtp_module in self.mtp_modules:
-                # 投影层使用 xavier 初始化
-                nn.init.xavier_uniform_(mtp_module['projection'].weight)
-                if mtp_module['projection'].bias is not None:
-                    nn.init.zeros_(mtp_module['projection'].bias)
-                
-                # LayerNorm 层保持默认初始化
-                
-                # Transformer 层的特定初始化
-                transformer = mtp_module['transformer']
-                
-                # 注意力层初始化
-                nn.init.xavier_uniform_(transformer.self_attn.q_proj.weight, gain=1/math.sqrt(2))
-                nn.init.xavier_uniform_(transformer.self_attn.k_proj.weight, gain=1/math.sqrt(2))
-                nn.init.xavier_uniform_(transformer.self_attn.v_proj.weight, gain=1/math.sqrt(2))
-                nn.init.xavier_uniform_(transformer.self_attn.o_proj.weight)
-                if hasattr(transformer.self_attn.o_proj, 'bias') and transformer.self_attn.o_proj.bias is not None:
-                    nn.init.zeros_(transformer.self_attn.o_proj.bias)
-                
-                # FFN 层初始化
-                nn.init.xavier_uniform_(transformer.mlp.gate_proj.weight)
-                nn.init.xavier_uniform_(transformer.mlp.up_proj.weight)
-                nn.init.xavier_uniform_(transformer.mlp.down_proj.weight)
-                
-                # RMSNorm 层保持默认初始化
-                # transformer.input_layernorm 和 transformer.post_attention_layernorm
+    def _init_mtp_module(self, module, config):
+        # 保持projection初始化
+        nn.init.normal_(module['projection'].weight, mean=0.0, std=config.initializer_range * 0.1)
         
+        # 新增：确保transformer层完全初始化
+        decoder_layer = module['transformer']
+        # 初始化LayerNorm的gamma参数为1（原模型默认）
+        nn.init.ones_(decoder_layer.input_layernorm.weight)
+        # nn.init.zeros_(decoder_layer.input_layernorm.bias)
+        nn.init.ones_(decoder_layer.post_attention_layernorm.weight)
+        # nn.init.zeros_(decoder_layer.post_attention_layernorm.bias)
+        
+        # 初始化注意力矩阵
+        attn = decoder_layer.self_attn
+        nn.init.normal_(attn.q_proj.weight, mean=0.0, std=config.initializer_range)
+        nn.init.normal_(attn.k_proj.weight, mean=0.0, std=config.initializer_range)
+        nn.init.normal_(attn.v_proj.weight, mean=0.0, std=config.initializer_range)
+        nn.init.normal_(attn.o_proj.weight, mean=0.0, std=config.initializer_range)
+        
+        # 初始化MLP层
+        mlp = decoder_layer.mlp
+        nn.init.normal_(mlp.gate_proj.weight, mean=0.0, std=config.initializer_range)
+        nn.init.normal_(mlp.up_proj.weight, mean=0.0, std=config.initializer_range)
+        nn.init.normal_(mlp.down_proj.weight, mean=0.0, std=config.initializer_range)
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -258,8 +256,8 @@ class MistralMTPModel(MistralModel):
                 check_nan(concat_features, "concat_features", i)
                 
                 projected = mtp_module['projection'](concat_features)
-                projected = mtp_module['proj_act'](projected)  # 添加激活函数
-                projected = mtp_module['pre_transformer_norm'](projected)  # 添加归一化
+                projected = torch.clamp(projected, min=-1e4, max=1e4)  # 限制数值范围
+                projected = mtp_module['pro_norm'](projected)
                 check_nan(projected, "projected", i)
                 
                 # 为 projected 生成新的 position_embeddings
@@ -348,7 +346,7 @@ class MistralMTPModel(MistralModel):
                                 print(f"  - value shape: {value.shape if value is not None else None}")
                     except Exception as e:
                         print(f"Warning: Error checking cache for MTP module {i}: {str(e)}")
-
+                
                 transformer_output = mtp_module['transformer'](
                     projected,
                     attention_mask=causal_mask,

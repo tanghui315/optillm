@@ -94,5 +94,117 @@ class TestMistralMTPModel(unittest.TestCase):
         self.assertEqual(outputs.logits.shape, expected_shape, 
                         f"logits形状应为{expected_shape}")
 
+    def test_projection_stability(self):
+        """测试 projection 层的数值稳定性"""
+        # 创建极端值输入
+        batch_size = 2
+        seq_len = 16
+        input_ids = torch.randint(0, self.config.vocab_size, (batch_size, seq_len)).to(self.device)
+        
+        # 1. 测试正常范围输入
+        outputs = self.model(input_ids)
+        self.assertFalse(torch.isnan(outputs.logits).any(), "正常输入下不应有NaN")
+        
+        # 2. 测试大值输入
+        large_embeds = self.model.get_input_embeddings()(input_ids) * 1000
+        outputs = self.model(inputs_embeds=large_embeds)
+        self.assertFalse(torch.isnan(outputs.logits).any(), "大值输入下不应有NaN")
+        
+        # 3. 测试小值输入
+        small_embeds = self.model.get_input_embeddings()(input_ids) * 0.001
+        outputs = self.model(inputs_embeds=small_embeds)
+        self.assertFalse(torch.isnan(outputs.logits).any(), "小值输入下不应有NaN")
+        
+        # 4. 测试混合极端值
+        mixed_embeds = self.model.get_input_embeddings()(input_ids)
+        mixed_embeds[:, :5] = 1000  # 前5个位置设为大值
+        mixed_embeds[:, 5:10] = 0.001  # 接下来5个位置设为小值
+        outputs = self.model(inputs_embeds=mixed_embeds)
+        self.assertFalse(torch.isnan(outputs.logits).any(), "混合极端值输入下不应有NaN")
+
+    def test_projection_gradient(self):
+        """测试 projection 层的梯度稳定性"""
+        batch_size = 2
+        seq_len = 16
+        input_ids = torch.randint(0, self.config.vocab_size, (batch_size, seq_len)).to(self.device)
+        labels = input_ids.clone()
+        labels[:, -1] = -100  # 设置最后一个token为目标
+        
+        # 启用梯度计算
+        self.model.train()
+        
+        # 1. 测试正常梯度
+        outputs = self.model(input_ids, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        
+        # 检查projection层的梯度
+        for i, module in enumerate(self.model.model.mtp_modules):
+            for name, param in module['projection'].named_parameters():
+                self.assertFalse(torch.isnan(param.grad).any(), 
+                               f"MTP模块{i}的projection层{name}存在NaN梯度")
+                self.assertFalse(torch.isinf(param.grad).any(), 
+                               f"MTP模块{i}的projection层{name}存在Inf梯度")
+                
+        # 2. 测试梯度范围
+        max_grad = max(p.grad.abs().max() for p in self.model.parameters() if p.grad is not None)
+        self.assertLess(max_grad, 1000, "梯度值不应过大")
+
+    def test_projection_intermediate_values(self):
+        """测试 projection 层的中间值"""
+        batch_size = 2
+        seq_len = 16
+        input_ids = torch.randint(0, self.config.vocab_size, (batch_size, seq_len)).to(self.device)
+        
+        # 注册钩子来捕获中间值
+        intermediate_values = {}
+        def hook_fn(name):
+            def hook(module, input, output):
+                intermediate_values[name] = output.detach()
+            return hook
+        
+        # 为每个MTP模块的projection层注册钩子
+        hooks = []
+        for i, module in enumerate(self.model.model.mtp_modules):
+            for j, layer in enumerate(module['projection']):
+                hook = layer.register_forward_hook(hook_fn(f'mtp_{i}_layer_{j}'))
+                hooks.append(hook)
+        
+        # 前向传播
+        outputs = self.model(input_ids)
+        
+        # 检查所有中间值
+        for name, value in intermediate_values.items():
+            self.assertFalse(torch.isnan(value).any(), f"{name}中存在NaN")
+            self.assertFalse(torch.isinf(value).any(), f"{name}中存在Inf")
+            
+            # 检查数值范围
+            max_val = value.abs().max().item()
+            self.assertLess(max_val, 1000, f"{name}的值范围过大: {max_val}")
+            
+            # 打印统计信息
+            print(f"\n{name} 统计信息:")
+            print(f"- 最小值: {value.min().item():.4f}")
+            print(f"- 最大值: {value.max().item():.4f}")
+            print(f"- 均值: {value.mean().item():.4f}")
+            print(f"- 标准差: {value.std().item():.4f}")
+        
+        # 移除钩子
+        for hook in hooks:
+            hook.remove()
+
+    def test_sequence_length_impact(self):
+        """测试不同序列长度对projection层的影响"""
+        batch_size = 2
+        for seq_len in [8, 16, 32, 48, 64]:  # 测试不同长度
+            input_ids = torch.randint(0, self.config.vocab_size, (batch_size, seq_len)).to(self.device)
+            
+            try:
+                outputs = self.model(input_ids)
+                self.assertFalse(torch.isnan(outputs.logits).any(), 
+                               f"序列长度{seq_len}时出现NaN")
+            except Exception as e:
+                self.fail(f"序列长度{seq_len}时发生错误: {str(e)}")
+
 if __name__ == "__main__":
     unittest.main()
