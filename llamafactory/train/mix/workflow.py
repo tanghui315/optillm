@@ -23,15 +23,6 @@ import torch
 import torch.nn as nn
 from .mistral_mtp_model import MistralMTPForCausalLM
 
-from ...model.loader import _get_init_kwargs,load_config
-from ...model.patcher import patch_config, patch_model
-from ...model.model_utils.liger_kernel import apply_liger_kernel
-from ...model.model_utils.mod import convert_pretrained_model_to_mod
-from ...model.model_utils.unsloth import load_unsloth_pretrained_model
-from ...model.adapter import init_adapter
-from ...model.model_utils.misc import register_autoclass
-from ...extras.misc import count_parameters
-
 from ...data import get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
 from ...extras.logging import get_logger
@@ -178,98 +169,6 @@ def get_mixed_dataset(template, model_args, data_args, training_args, **kwargs):
         combined_dataset["train_dataset"] = train_dataset
 
     return combined_dataset
-
-
-def load_mtp_model(
-    tokenizer,
-    model_args: "ModelArguments",
-    finetuning_args: "FinetuningArguments",
-    is_trainable: bool = False,
-    add_valuehead: bool = False,
-):
-    logger.info_rank0("Starting model loading process...")
-    init_kwargs = _get_init_kwargs(model_args)
-    
-    # 添加 FSDP 相关配置
-    init_kwargs.update({
-        "low_cpu_mem_usage": True,
-        "torch_dtype": model_args.compute_dtype,
-    })
-    
-    config = load_config(model_args)
-    patch_config(config, tokenizer, model_args, init_kwargs, is_trainable)
-    apply_liger_kernel(config, model_args, is_trainable, require_logits=(finetuning_args.stage not in ["pt", "sft"]))
-
-    model = None
-    lazy_load = False
-    if model_args.use_unsloth:
-        if model_args.adapter_name_or_path is not None:
-            lazy_load = True
-        elif is_trainable:
-            model = load_unsloth_pretrained_model(config, model_args)
-
-    setattr(config, "n_future_tokens", 2)
-    logger.info_rank0("Set n_future_tokens to 2")
-
-    if model is None and not lazy_load:
-        init_kwargs["config"] = config
-        init_kwargs["pretrained_model_name_or_path"] = model_args.model_name_or_path
-        # 添加内存优化相关参数
-        load_class = MistralMTPForCausalLM
-
-        if model_args.train_from_scratch:
-            # 从头开始训练时使用新架构
-            model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
-        else:
-            model = load_class.from_pretrained(**init_kwargs)
-            
-        # # 确保模型在正确的设备上
-        # if torch.cuda.is_available():
-        #     model = model.cuda()
-            
-        logger.info_rank0("Model loading completed successfully")
-
-    if not lazy_load:
-        patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)
-        register_autoclass(config, model, tokenizer)
-
-    
-    model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
-    
-    if is_trainable:
-        if hasattr(model.model, "mtp_modules"):
-            for module in model.model.mtp_modules:
-                # 确保 projection 和 transformer 都是可训练的
-                module['projection'].requires_grad_(True)
-                module['transformer'].requires_grad_(True)
-                logger.info_rank0(f"Set projection and transformer to trainable")
-    
-    if not is_trainable:
-        model.requires_grad_(False)
-        for param in model.parameters():
-            if param.data.dtype == torch.float32 and model_args.compute_dtype != torch.float32:
-                param.data = param.data.to(model_args.compute_dtype)
-        model.eval()
-    else:
-        model.train()
-
-    trainable_params, all_param = count_parameters(model)
-    if is_trainable:
-        param_stats = "trainable params: {:,} || all params: {:,} || trainable%: {:.4f}".format(
-            trainable_params, all_param, 100 * trainable_params / all_param
-        )
-    else:
-        param_stats = f"all params: {all_param:,}"
-
-    logger.info_rank0(param_stats)
-
-    if model_args.print_param_status and int(os.getenv("LOCAL_RANK", "0")) == 0:
-        for name, param in model.named_parameters():
-            print(f"name: {name}, dtype: {param.dtype}, device: {param.device}, trainable: {param.requires_grad}")
-    # 输出 model_args.compute_dtype
-    logger.info_rank0(f"model_args.compute_dtype: {model_args.compute_dtype}")
-    
-    return model
 
 
 def run_mixed(
