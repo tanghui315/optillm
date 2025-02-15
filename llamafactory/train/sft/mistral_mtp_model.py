@@ -29,42 +29,40 @@ class MistralMTPModel(MistralModel):
         self.n_future_tokens = getattr(config, "n_future_tokens", 1)  # 默认为1，兼容原始模型
         
         if self.n_future_tokens > 1:
+            # 获取原模型最后一层的引用
+            last_layer = self.layers[-1] if len(self.layers) > 0 else None
+            
             self.mtp_modules = nn.ModuleList([
                 nn.ModuleDict({
-                    'projection':nn.Linear(config.hidden_size * 2, config.hidden_size),  # 使用自定义模块
+                    'projection': nn.Linear(config.hidden_size * 2, config.hidden_size),
                     'pro_norm': MistralRMSNorm(config.hidden_size, eps=1e-5),
-                    'transformer': MistralDecoderLayer(config, len(self.layers) + i)
+                    'transformer': self._create_mtp_layer(config, layer_idx=len(self.layers)+i, src_layer=last_layer)
                 }) for i in range(self.n_future_tokens)
             ])
-        #self.post_init()
             # 调用 _init_mtp_module 对每个 MTP 模块进行初始化，确保与原模型一致
             for module in self.mtp_modules:
                 self._init_mtp_module(module, config)
             
     def _init_mtp_module(self, module, config):
-        # 保持projection初始化
+        # 对projection层使用更小的初始化范围
         nn.init.normal_(module['projection'].weight, mean=0.0, std=config.initializer_range * 0.1)
+
+    def _create_mtp_layer(self, config, layer_idx: int, src_layer: Optional[nn.Module] = None):
+        new_layer = MistralDecoderLayer(config, layer_idx)
         
-        # 新增：确保transformer层完全初始化
-        decoder_layer = module['transformer']
-        # 初始化LayerNorm的gamma参数为1（原模型默认）
-        nn.init.ones_(decoder_layer.input_layernorm.weight)
-        # nn.init.zeros_(decoder_layer.input_layernorm.bias)
-        nn.init.ones_(decoder_layer.post_attention_layernorm.weight)
-        # nn.init.zeros_(decoder_layer.post_attention_layernorm.bias)
-        
-        # 初始化注意力矩阵
-        attn = decoder_layer.self_attn
-        nn.init.normal_(attn.q_proj.weight, mean=0.0, std=config.initializer_range)
-        nn.init.normal_(attn.k_proj.weight, mean=0.0, std=config.initializer_range)
-        nn.init.normal_(attn.v_proj.weight, mean=0.0, std=config.initializer_range)
-        nn.init.normal_(attn.o_proj.weight, mean=0.0, std=config.initializer_range)
-        
-        # 初始化MLP层
-        mlp = decoder_layer.mlp
-        nn.init.normal_(mlp.gate_proj.weight, mean=0.0, std=config.initializer_range)
-        nn.init.normal_(mlp.up_proj.weight, mean=0.0, std=config.initializer_range)
-        nn.init.normal_(mlp.down_proj.weight, mean=0.0, std=config.initializer_range)
+        # 如果源层存在，则复制权重
+        if src_layer is not None:
+            # 深拷贝所有可学习参数
+            new_layer.load_state_dict(src_layer.state_dict(), strict=False)
+            
+            # 特殊处理位置相关的参数（如旋转位置编码）
+            if hasattr(new_layer.self_attn, 'rotary_emb'):
+                with torch.no_grad():
+                    new_layer.self_attn.rotary_emb.inv_freq.copy_(
+                        src_layer.self_attn.rotary_emb.inv_freq
+                    )
+                
+        return new_layer
 
     def forward(
         self,
