@@ -29,19 +29,24 @@ class MistralMTPModel(MistralModel):
         self.n_future_tokens = getattr(config, "n_future_tokens", 1)  # 默认为1，兼容原始模型
         
         if self.n_future_tokens > 1:
-            # 获取原模型最后一层的引用
-            last_layer = self.layers[-1] if len(self.layers) > 0 else None
-            
+            # 确保使用正确的数据类型初始化新模块
+            dtype = getattr(config, "torch_dtype", torch.bfloat16)
             self.mtp_modules = nn.ModuleList([
                 nn.ModuleDict({
-                    'projection': nn.Linear(config.hidden_size * 2, config.hidden_size),
+                    'projection': nn.Linear(config.hidden_size * 2, config.hidden_size, dtype=dtype),
                     'pro_norm': MistralRMSNorm(config.hidden_size, eps=1e-5),
-                    'transformer': self._create_mtp_layer(config, layer_idx=len(self.layers)+i, src_layer=last_layer)
+                    'transformer': MistralDecoderLayer(config, len(self.layers) + i)
+                    #'transformer': self._create_mtp_layer(config, layer_idx=len(self.layers)+i, src_layer=last_layer)
                 }) for i in range(self.n_future_tokens)
             ])
-            # 调用 _init_mtp_module 对每个 MTP 模块进行初始化，确保与原模型一致
+            
             for module in self.mtp_modules:
                 self._init_mtp_module(module, config)
+                # 确保所有参数使用相同的数据类型
+                for param in module.parameters():
+                    param.data = param.data.to(dtype)
+            
+        self.post_init()
             
     def _init_mtp_module(self, module, config):
         # 对projection层使用更小的初始化范围
@@ -411,8 +416,12 @@ class MistralMTPForCausalLM(MistralForCausalLM):
     
     def __init__(self, config):
         super().__init__(config)
+        # 添加调试信息
+        logger.info_rank0("Initializing MistralMTPForCausalLM")
         # 替换原始的MistralModel为MistralMTPModel
         self.model = MistralMTPModel(config)
+        logger.info_rank0(f"Created MistralMTPModel with n_future_tokens: {self.model.n_future_tokens}")
+        logger.info_rank0(f"Has mtp_modules: {hasattr(self.model, 'mtp_modules')}")
     
     # 添加这个方法来帮助 PEFT 找到正确的层
     def get_decoder(self):
@@ -422,25 +431,48 @@ class MistralMTPForCausalLM(MistralForCausalLM):
     def get_wrapped_policy(self):
         """返回 FSDP 包装策略"""
         from torch.distributed.fsdp.wrap import (
-            size_based_auto_wrap_policy,
             transformer_auto_wrap_policy,
+            _module_wrap_policy,
         )
         from functools import partial
         from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 
-        # 定义不需要包装的模块类型
-        no_wrap_modules = {
-            MistralMTPModel,  # 主模型
-            nn.ModuleList,  # ModuleList
-            nn.Linear,  # 线性层（包括 lm_head 和 future_lm_heads）
+        # 定义需要单独包装的 MTP 模块类型
+        mtp_module_types = {
+            nn.ModuleDict,  # MTP 模块的容器类型
+            MistralDecoderLayer,  # MTP 模块中的解码层
+            nn.Linear,  # MTP 模块中的线性层
         }
 
-        # 使用 transformer_auto_wrap_policy
-        return partial(
+        # 定义基础模型的包装策略
+        base_policy = partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={MistralDecoderLayer},  # Decoder层需要被分割
-            no_wrap_modules=no_wrap_modules,  # 指定不需要包装的模块
+            transformer_layer_cls={MistralDecoderLayer},
+            no_wrap_modules={
+                MistralMTPModel,
+                nn.ModuleList,
+                nn.Linear
+            }
         )
+
+        # 自定义包装策略
+        def custom_wrap_policy(module, recurse, **kwargs):
+            # 优先处理 MTP 模块
+            if any(isinstance(module, t) for t in mtp_module_types):
+                return True
+            
+            # 其他模块使用基础策略
+            return base_policy(module, recurse, **kwargs)
+
+        return custom_wrap_policy
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        """确保 MTP 模块也启用梯度检查点"""
+        if isinstance(module, MistralMTPModel):
+            module.gradient_checkpointing = value
+            # 同时设置 MTP 模块中的梯度检查点
+            for mtp_module in module.mtp_modules:
+                mtp_module.transformer.gradient_checkpointing = value
 
     def forward(
         self,
@@ -616,7 +648,6 @@ def load_mtp_model(
             model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
         else:
             model = load_class.from_pretrained(**init_kwargs)
-            
 
         logger.info_rank0("Model loading completed successfully")
 
@@ -624,17 +655,39 @@ def load_mtp_model(
         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)
         register_autoclass(config, model, tokenizer)
 
+    # 先调用 init_adapter
+    # model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
     
-    model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
-    
+    # 在 init_adapter 之后设置参数的可训练状态
     if is_trainable:
+        logger.info_rank0("Freezing all parameters except mtp_modules")
+        
+        # 先将所有参数设置为不可训练
+        for name, param in model.named_parameters():
+            param.requires_grad_(False)
+            # 确保所有参数都使用相同的数据类型
+            if param.dtype != model_args.compute_dtype:
+                param.data = param.data.to(model_args.compute_dtype)
+        
+        # 设置 mtp_modules 参数为可训练
+        trainable_layers = []
         if hasattr(model.model, "mtp_modules"):
-            for module in model.model.mtp_modules:
-                # 确保 projection 和 transformer 都是可训练的
-                module['projection'].requires_grad_(True)
-                module['transformer'].requires_grad_(True)
-                logger.info_rank0(f"Set projection and transformer to trainable")
-    
+            trainable_params_count = 0
+            for i in range(len(model.model.mtp_modules)):
+                trainable_layers.append(f"mtp_modules.{i}.")
+            
+            # 设置可训练参数
+            for name, param in model.named_parameters():
+                if any(layer in name for layer in trainable_layers):
+                    param.requires_grad_(True)
+                    trainable_params_count += param.numel()
+                    logger.info_rank0(f"Set param {name} trainable, size: {param.numel()}, dtype: {param.dtype}")
+            
+            logger.info_rank0(f"Set trainable layers: {','.join(trainable_layers)}")
+            logger.info_rank0(f"Total trainable parameters: {trainable_params_count:,}")
+        else:
+            logger.warning_rank0("mtp_modules not found in model!")
+
     if not is_trainable:
         model.requires_grad_(False)
         for param in model.parameters():
@@ -644,11 +697,21 @@ def load_mtp_model(
     else:
         model.train()
 
+    # 重新统计参数
     trainable_params, all_param = count_parameters(model)
     if is_trainable:
         param_stats = "trainable params: {:,} || all params: {:,} || trainable%: {:.4f}".format(
             trainable_params, all_param, 100 * trainable_params / all_param
         )
+        # 添加验证
+        if trainable_params == 0:
+            logger.warning_rank0("Warning: No trainable parameters found!")
+            # 打印所有 mtp_modules 的参数状态
+            if hasattr(model.model, "mtp_modules"):
+                logger.info_rank0("MTP modules parameter status:")
+                for i, module in enumerate(model.model.mtp_modules):
+                    for name, param in module.named_parameters():
+                        logger.info_rank0(f"Module {i} - {name}: requires_grad={param.requires_grad}, dtype={param.dtype}")
     else:
         param_stats = f"all params: {all_param:,}"
 
@@ -657,7 +720,7 @@ def load_mtp_model(
     if model_args.print_param_status and int(os.getenv("LOCAL_RANK", "0")) == 0:
         for name, param in model.named_parameters():
             print(f"name: {name}, dtype: {param.dtype}, device: {param.device}, trainable: {param.requires_grad}")
-    # 输出 model_args.compute_dtype
+            
     logger.info_rank0(f"model_args.compute_dtype: {model_args.compute_dtype}")
     
     return model
