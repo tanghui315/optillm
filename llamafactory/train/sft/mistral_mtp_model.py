@@ -33,20 +33,25 @@ class LightweightMTPHead(nn.Module):
         if hasattr(config, 'share_attention_weights') and config.share_attention_weights:
             self.attention = None  # 实际使用时会共享主模型的注意力层
 
-    def forward(self, hidden_states, base_attention_output):
+    def forward(
+        self, 
+        base_hidden_state: torch.Tensor,  # 主模型当前层的隐藏状态
+        prev_attention_output: torch.Tensor  # 前一层（主模型）的注意力输出
+    ) -> torch.Tensor:
         """
-        hidden_states: 主模型的隐藏状态 [batch, seq_len, hidden_size]
-        base_attention_output: 主模型最后一层的注意力输出
+        Args:
+            base_hidden_state: [batch, seq_len, hidden_size] 来自主模型当前层的输出
+            prev_attention_output: [batch, seq_len, hidden_size] 主模型前一层的注意力输出
         """
         if self.attention is not None:
-            # 如果有独立注意力层
-            x = self.attention(hidden_states)
+            # 使用独立注意力层处理当前隐藏状态
+            attention_output = self.attention(base_hidden_state)
         else:
-            # 直接复用主模型的注意力输出
-            x = base_attention_output
+            # 直接复用主模型前一层的注意力输出
+            attention_output = prev_attention_output
             
-        projected = self.projection(x)
-        return self.norm(x + projected)  # 残差连接
+        projected = self.projection(attention_output)
+        return self.norm(attention_output + projected)
 
 class MistralMTPModel(MistralModel):
     def __init__(self, config):
