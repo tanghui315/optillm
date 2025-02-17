@@ -1,0 +1,73 @@
+# Model arguments
+model_name_or_path: /home/ubuntu/cjr/merged_models
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+# Data training arguments
+dataset_name: /home/ubuntu/cjr/data/RL.jsonl
+dataset_configs:
+- all
+
+# GRPO trainer config
+bf16: true
+use_vllm: true
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+do_eval: true
+eval_strategy: steps
+eval_steps: 200
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+# PEFT arguments
+use_peft: true
+peft_type: lora  # 使用 LoRA
+lora_alpha: 32   # LoRA scaling factor
+lora_dropout: 0.05
+lora_r: 16        # LoRA rank
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+use_rslora: true
+use_dora: true
+
+reward_funcs:
+  - accuracy      # 检查答案正确性
+  - format        # 检查格式是否符合要求 (<think></think><answer></answer>)
+  - reasoning_steps  # 检查是否有清晰的推理步骤
+  - cosine        # 基于长度的余弦缩放奖励
+  - repetition_penalty  # 重复惩罚
+  - length        # 长度奖励
+
+cosine_max_len: 4096
+
+repetition_n_grams: 5         # n-gram 大小
+repetition_max_penalty: -1.0  # 最大惩罚值
+
+learning_rate: 1.0e-05
+log_level: info
+logging_steps: 5
+logging_strategy: steps
+lr_scheduler_type: cosine
+max_prompt_length: 2048
+max_completion_length: 4096
+max_steps: -1
+num_generations: 2
+num_train_epochs: 1
+output_dir: ./codestral_think
+overwrite_output_dir: true
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 1
+push_to_hub: false
+save_strategy: steps
+save_steps: 500
+seed: 42
+warmup_ratio: 0.1
