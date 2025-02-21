@@ -21,23 +21,23 @@ gradient_accumulation_steps: 1
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-
+use_unsloth: true
 # PEFT arguments
-use_peft: true
-peft_type: lora  # 使用 LoRA
-lora_alpha: 32   # LoRA scaling factor
-lora_dropout: 0.05
-lora_r: 16        # LoRA rank
-lora_target_modules:
-  - q_proj
-  - k_proj
-  - v_proj
-  - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
-use_rslora: true
-use_dora: true
+# use_peft: true
+# peft_type: lora  # 使用 LoRA
+# lora_alpha: 32   # LoRA scaling factor
+# lora_dropout: 0.05
+# lora_r: 16        # LoRA rank
+# lora_target_modules:
+#   - q_proj
+#   - k_proj
+#   - v_proj
+#   - o_proj
+#   - gate_proj
+#   - up_proj
+#   - down_proj
+# use_rslora: true
+# use_dora: true
 
 reward_funcs:
   - accuracy      # 检查答案正确性
