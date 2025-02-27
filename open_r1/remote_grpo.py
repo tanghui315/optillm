@@ -27,19 +27,17 @@ from transformers.trainer_utils import get_last_checkpoint
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
     accuracy_reward,
-    code_reward,
     format_reward,
-    get_code_format_reward,
     get_cosine_scaled_reward,
     get_repetition_penalty_reward,
     len_reward,
     reasoning_steps_reward,
-    tag_count_reward,
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from open_r1.trainers.remote_grpo_trainer import RemoteGRPOTrainer, RemoteGRPOConfig
 
 
 logger = logging.getLogger(__name__)
@@ -52,7 +50,7 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'.
+            List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length'.
         cosine_min_value_wrong (`float`):
             Minimum reward for cosine scaling for wrong answers.
         cosine_max_value_wrong (`float`):
@@ -63,14 +61,12 @@ class GRPOScriptArguments(ScriptArguments):
             Maximum reward for cosine scaling for correct answers.
         cosine_max_len (`int`):
             Maximum length for cosine scaling.
-        code_language (`str`):
-            Language for code format reward.
     """
 
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy", "format", "tag_count"],
+        default_factory=lambda: ["accuracy", "format"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -100,13 +96,6 @@ class GRPOScriptArguments(ScriptArguments):
     repetition_max_penalty: float = field(
         default=-1.0,
         metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
-    )
-    code_language: str = field(
-        default="python",
-        metadata={
-            "help": "Language for code format reward. Based on E2B supported languages https://e2b.dev/docs/code-interpreting/supported-languages",
-            "choices": ["python", "javascript", "r", "java", "bash"],
-        },
     )
 
 
@@ -173,9 +162,6 @@ def main(script_args, training_args, model_args):
             max_penalty=script_args.repetition_max_penalty,
         ),
         "length": len_reward,
-        "code": code_reward,
-        "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
@@ -211,13 +197,11 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GRPOTrainer(
+    trainer = RemoteGRPOTrainer(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
     )
@@ -275,6 +259,6 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
-    parser = TrlParser((GRPOScriptArguments, GRPOConfig, ModelConfig))
+    parser = TrlParser((GRPOScriptArguments, RemoteGRPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)

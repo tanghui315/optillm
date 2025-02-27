@@ -23,19 +23,18 @@ import transformers
 from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
+from transformers.models.bits_and_bytes.config import BitsAndBytesConfig
 
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
     accuracy_reward,
     code_reward,
-    format_reward,
-    get_code_format_reward,
     get_cosine_scaled_reward,
     get_repetition_penalty_reward,
+    get_code_format_reward,
     len_reward,
-    reasoning_steps_reward,
-    tag_count_reward,
 )
+from open_r1.utils.felix import (make_conversation,reasoning_steps_reward,format_reward,load_dataset_from_source)   
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
@@ -52,7 +51,7 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'.
+            List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length'.
         cosine_min_value_wrong (`float`):
             Minimum reward for cosine scaling for wrong answers.
         cosine_max_value_wrong (`float`):
@@ -65,12 +64,20 @@ class GRPOScriptArguments(ScriptArguments):
             Maximum length for cosine scaling.
         code_language (`str`):
             Language for code format reward.
+        load_in_4bit (`bool`):
+            Whether to use 4-bit quantization.
+        bnb_4bit_quant_type (`str`):
+            Quantization type for 4-bit quantization.
+        bnb_4bit_compute_dtype (`str`):
+            Compute dtype for 4-bit quantization.
+        use_nested_quant (`bool`):
+            Whether to use nested quantization.
     """
 
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy", "format", "tag_count"],
+        default_factory=lambda: ["accuracy", "format"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'code', 'code_format'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -108,6 +115,57 @@ class GRPOScriptArguments(ScriptArguments):
             "choices": ["python", "javascript", "r", "java", "bash"],
         },
     )
+    load_in_4bit: bool = field(
+        default=True,
+        metadata={"help": "Whether to use 4-bit quantization"},
+    )
+    bnb_4bit_quant_type: str = field(
+        default="nf4",
+        metadata={"help": "Quantization type for 4-bit quantization"},
+    )
+    bnb_4bit_compute_dtype: str = field(
+        default="bfloat16",
+        metadata={"help": "Compute dtype for 4-bit quantization"},
+    )
+    use_nested_quant: bool = field(
+        default=False,
+        metadata={"help": "Whether to use nested quantization"},
+    )
+
+
+def get_qlora_model_kwargs(script_args, training_args, model_args):
+    """获取QLoRA模型加载参数"""
+    compute_dtype = (
+        torch.bfloat16 if script_args.bnb_4bit_compute_dtype == "bfloat16" else torch.float16
+    )
+    
+    # 保留原有参数
+    torch_dtype = (
+        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] 
+        else getattr(torch, model_args.torch_dtype)
+    )
+    
+    base_kwargs = {
+        "revision": model_args.model_revision,
+        "trust_remote_code": model_args.trust_remote_code,
+        "attn_implementation": model_args.attn_implementation,
+        "torch_dtype": torch_dtype,
+        "use_cache": False if training_args.gradient_checkpointing else True,
+    }
+    
+    # 添加QLoRA配置
+    qlora_config = {
+        "load_in_4bit": script_args.load_in_4bit,
+        "quantization_config": BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_quant_type=script_args.bnb_4bit_quant_type,
+            bnb_4bit_use_double_quant=script_args.use_nested_quant,
+        ),
+        "device_map": {"": training_args.device},
+    }
+    
+    return {**base_kwargs, **qlora_config}
 
 
 def main(script_args, training_args, model_args):
@@ -149,8 +207,8 @@ def main(script_args, training_args, model_args):
         init_wandb_training(training_args)
 
     # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-
+    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    dataset = load_dataset_from_source(script_args.dataset_name, name=script_args.dataset_config)
     ################
     # Load tokenizer
     ################
@@ -175,19 +233,9 @@ def main(script_args, training_args, model_args):
         "length": len_reward,
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
-    # Format into conversation
-    def make_conversation(example):
-        prompt = []
-
-        if training_args.system_prompt is not None:
-            prompt.append({"role": "system", "content": training_args.system_prompt})
-
-        prompt.append({"role": "user", "content": example["problem"]})
-        return {"prompt": prompt}
 
     dataset = dataset.map(make_conversation)
 
@@ -199,25 +247,24 @@ def main(script_args, training_args, model_args):
     torch_dtype = (
         model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
     )
-    model_kwargs = dict(
-        revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
-        attn_implementation=model_args.attn_implementation,
-        torch_dtype=torch_dtype,
-        use_cache=False if training_args.gradient_checkpointing else True,
-    )
+    model_kwargs = get_qlora_model_kwargs(script_args, training_args, model_args)
     training_args.model_init_kwargs = model_kwargs
 
     #############################
     # Initialize the GRPO trainer
     #############################
+    peft_config = get_peft_config(model_args)
+    if peft_config:
+        # 确保使用QLoRA配置
+        peft_config.quantization_config = model_kwargs["quantization_config"]
+
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        peft_config=get_peft_config(model_args),
+        peft_config=peft_config,
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
     )

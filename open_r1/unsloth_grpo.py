@@ -23,24 +23,33 @@ import transformers
 from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
+import torch.cuda
+# from transformers.utils import is_bfloat16_supported
+# from typing import Optional
 
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
     accuracy_reward,
     code_reward,
-    format_reward,
-    get_code_format_reward,
     get_cosine_scaled_reward,
     get_repetition_penalty_reward,
     len_reward,
-    reasoning_steps_reward,
-    tag_count_reward,
 )
+from open_r1.utils.felix import (make_conversation,reasoning_steps_reward,format_reward,load_dataset_from_source)   
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
-
+from unsloth import FastLanguageModel, PatchFastRL, is_bfloat16_supported
+HAS_UNSLOTH = True
+PatchFastRL("GRPO", FastLanguageModel)
+# # 有条件地导入unsloth
+# try:
+#     from unsloth import FastLanguageModel, PatchFastRL, is_bfloat16_supported
+#     HAS_UNSLOTH = True
+#     PatchFastRL("GRPO", FastLanguageModel)
+# except ImportError:
+#     HAS_UNSLOTH = False
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +61,7 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'.
+            List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length'.
         cosine_min_value_wrong (`float`):
             Minimum reward for cosine scaling for wrong answers.
         cosine_max_value_wrong (`float`):
@@ -63,14 +72,12 @@ class GRPOScriptArguments(ScriptArguments):
             Maximum reward for cosine scaling for correct answers.
         cosine_max_len (`int`):
             Maximum length for cosine scaling.
-        code_language (`str`):
-            Language for code format reward.
     """
 
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy", "format", "tag_count"],
+        default_factory=lambda: ["accuracy", "format"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -101,13 +108,57 @@ class GRPOScriptArguments(ScriptArguments):
         default=-1.0,
         metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
     )
-    code_language: str = field(
-        default="python",
-        metadata={
-            "help": "Language for code format reward. Based on E2B supported languages https://e2b.dev/docs/code-interpreting/supported-languages",
-            "choices": ["python", "javascript", "r", "java", "bash"],
-        },
+    use_unsloth: bool = field(
+        default=False,
+        metadata={"help": "Whether to use Unsloth optimization"},
     )
+    max_seq_length: int = field(
+        default=8192,
+        metadata={"help": "Maximum sequence length for Unsloth"},
+    )
+    lora_rank: int = field(
+        default=16,
+        metadata={"help": "LoRA rank for Unsloth"},
+    )
+    lora_alpha_value: int = field(
+        default=32,
+        metadata={"help": "LoRA alpha for Unsloth"},
+    )
+    gpu_memory_utilization: float = field(
+        default=0.7,
+        metadata={"help": "GPU memory utilization for Unsloth"},
+    )
+
+
+def get_unsloth_model_and_tokenizer(model_name: str, script_args: GRPOScriptArguments):
+    """获取Unsloth优化的模型和tokenizer"""
+    if not HAS_UNSLOTH:
+        raise ImportError("Unsloth is not installed. Please install it with `pip install unsloth`")
+    
+    # 加载模型和tokenizer
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=script_args.max_seq_length,
+        load_in_4bit=True,  # 使用4bit量化
+        fast_inference=True,  # 启用vLLM快速推理
+        max_lora_rank=script_args.lora_rank,
+        gpu_memory_utilization=script_args.gpu_memory_utilization,
+    )
+
+    # 配置PEFT
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=script_args.lora_rank,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_alpha=script_args.lora_alpha_value,
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
+    )
+
+    return model, tokenizer
 
 
 def main(script_args, training_args, model_args):
@@ -148,13 +199,45 @@ def main(script_args, training_args, model_args):
     if "wandb" in training_args.report_to:
         init_wandb_training(training_args)
 
-    # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-
-    ################
-    # Load tokenizer
-    ################
-    tokenizer = get_tokenizer(model_args, training_args)
+    # 根据use_unsloth参数调整训练配置
+    if script_args.use_unsloth:
+        # 使用Unsloth推荐的训练参数
+        training_args.use_vllm = True
+        training_args.optim = "paged_adamw_8bit"
+        training_args.bf16 = is_bfloat16_supported()
+        training_args.fp16 = not is_bfloat16_supported()
+        training_args.learning_rate = 5e-6
+        training_args.adam_beta1 = 0.9
+        training_args.adam_beta2 = 0.99
+        training_args.weight_decay = 0.1
+        training_args.warmup_ratio = 0.1
+        training_args.lr_scheduler_type = "cosine"
+        
+        # 加载数据集
+        dataset = load_dataset_from_source(script_args.dataset_name, name=script_args.dataset_config)
+        
+        # 使用Unsloth加载模型和tokenizer
+        model, tokenizer = get_unsloth_model_and_tokenizer(
+            model_args.model_name_or_path,
+            script_args,
+        )
+    else:
+        # 原有的模型加载流程
+        tokenizer = get_tokenizer(model_args, training_args)
+        dataset = load_dataset_from_source(script_args.dataset_name, name=script_args.dataset_config)
+        
+        torch_dtype = (
+            model_args.torch_dtype if model_args.torch_dtype in ["auto", None] 
+            else getattr(torch, model_args.torch_dtype)
+        )
+        model_kwargs = dict(
+            revision=model_args.model_revision,
+            trust_remote_code=model_args.trust_remote_code,
+            attn_implementation=model_args.attn_implementation,
+            torch_dtype=torch_dtype,
+            use_cache=False if training_args.gradient_checkpointing else True,
+        )
+        training_args.model_init_kwargs = model_kwargs
 
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
@@ -174,23 +257,11 @@ def main(script_args, training_args, model_args):
         ),
         "length": len_reward,
         "code": code_reward,
-        "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
-    # Format into conversation
-    def make_conversation(example):
-        prompt = []
-
-        if training_args.system_prompt is not None:
-            prompt.append({"role": "system", "content": training_args.system_prompt})
-
-        prompt.append({"role": "user", "content": example["problem"]})
-        return {"prompt": prompt}
-
+    # 数据预处理
     dataset = dataset.map(make_conversation)
-
     for split in dataset:
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
@@ -212,12 +283,12 @@ def main(script_args, training_args, model_args):
     # Initialize the GRPO trainer
     #############################
     trainer = GRPOTrainer(
-        model=model_args.model_name_or_path,
+        model=model if script_args.use_unsloth else model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        peft_config=get_peft_config(model_args),
+        peft_config=None if script_args.use_unsloth else get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
     )

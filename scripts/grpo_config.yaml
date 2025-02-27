@@ -12,6 +12,9 @@ dataset_configs:
 bf16: true
 use_vllm: true
 vllm_device: auto
+vllm_dtype: bfloat16
+vllm_max_model_len: 8192
+vllm_tensor_parallel_size: 2  # 使用2张卡做tensor parallel
 vllm_gpu_memory_utilization: 0.9
 
 do_eval: true
