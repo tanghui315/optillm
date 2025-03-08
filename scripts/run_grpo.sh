@@ -11,3 +11,17 @@ export MKL_SERVICE_FORCE_INTEL=1
 ACCELERATE_LOG_LEVEL=info accelerate launch --config_file recipes/accelerate_configs/zero3.yaml \
     --num_processes=6 src/open_r1/grpo.py \
     --config ./grpo_config.yaml
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 ACCELERATE_LOG_LEVEL=info accelerate launch --config_file recipes/accelerate_configs/zero3.yaml \
+    --num_processes=6 src/open_r1/faster_grpo.py \
+    --config ./config_fast_grpo.yaml
+
+
+docker run --runtime nvidia --shm-size=32g  --gpus '"device=6,7"' -p 5903:30000 \
+    -v /home/ubuntu/33b_coder/models/merged_model:/models \
+    lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server --model-path /models --host 0.0.0.0 --port 30000 --tp 2 
+
+
+export MKL_THREADING_LAYER=GNU
+export MKL_SERVICE_FORCE_INTEL=1
+ python -m sglang.launch_server --model-path /home/ubuntu/33b_coder/models/merged_model --host 0.0.0.0 --port 30000 --tp 2 --enable-p2p-check 

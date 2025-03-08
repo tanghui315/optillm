@@ -24,7 +24,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing import reduction
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, TYPE_CHECKING
 from unittest.mock import patch
 from transformers.utils import is_liger_kernel_available
 import torch
@@ -56,6 +56,12 @@ from trl.data_utils import is_conversational, maybe_apply_chat_template
 from trl.trainer.utils import pad, selective_log_softmax
 from vllm import LLM, SamplingParams
 
+if TYPE_CHECKING:
+    from peft import PeftConfig
+
+def is_peft_model(model):
+    """Check if a model is a PEFT model."""
+    return hasattr(model, "peft_config")
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
@@ -144,6 +150,8 @@ class FastGRPOConfig(trl.GRPOConfig):
     remote_gen_model_n_gpus: str = field(
         default=8,
     )
+    chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+
 
 
 class FastGRPOTrainer(Trainer):
@@ -159,6 +167,7 @@ class FastGRPOTrainer(Trainer):
         data_collator: Optional[DataCollatorWithPadding] = None,
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
+        peft_config: Optional["PeftConfig"] = None,
     ) -> None:
         self.args = args
         self.reward_funcs = reward_funcs
@@ -200,21 +209,20 @@ class FastGRPOTrainer(Trainer):
             )
             model_str = model
             model = AutoModelForCausalLM.from_pretrained(model_str, **model_init_kwargs)
-            # offload to cpu
-            ref_model = AutoModelForCausalLM.from_pretrained(model_str, **model_init_kwargs) #.to("cpu")
+            
+            # 添加 peft 支持
+            if peft_config is not None:
+                from peft import get_peft_model
+                model = get_peft_model(model, peft_config)
+                # 如果使用 PEFT，ref_model 应该为 None，因为可以通过禁用 adapter 来获得原始模型
+                ref_model = None
+            else:
+                # 只在不使用 PEFT 时创建 ref_model
+                ref_model = AutoModelForCausalLM.from_pretrained(model_str, **model_init_kwargs) #.to("cpu")
 
         self.model = model
         self.ref_model = ref_model
-        if self.args.use_liger_kernel:
-            if is_liger_kernel_available():
-                from liger_kernel.transformers import _apply_liger_kernel_to_instance
-                _apply_liger_kernel_to_instance(model=self.model)
-                _apply_liger_kernel_to_instance(model=self.ref_model)
-            else:
-                raise ImportError(
-                    "You have set `use_liger_kernel` to `True` but liger-kernel >= 0.3.0 is not available. "
-                    "Please install it with `pip install liger-kernel`"
-                )
+        
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
@@ -230,6 +238,41 @@ class FastGRPOTrainer(Trainer):
 
         self.data_collator = data_collator
 
+        # 2. 调用父类Trainer的初始化方法，确保正确初始化
+        super().__init__(
+            model=model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers
+        )
+        
+        # 3. 在正确初始化之后应用Liger Kernel优化
+        if self.args.use_liger_kernel:
+            if is_liger_kernel_available():
+                from liger_kernel.transformers import _apply_liger_kernel_to_instance
+                
+                # 检查是否为PEFT模型
+                if hasattr(self.model, "get_base_model"):
+                    # 获取基础模型
+                    base_model = self.model.get_base_model()
+                    # 对基础模型应用优化
+                    _apply_liger_kernel_to_instance(model=base_model)
+                    print("已对PEFT模型的基础模型应用Liger Kernel优化")
+                else:
+                    # 非PEFT模型，直接应用优化
+                    _apply_liger_kernel_to_instance(model=self.model)
+                    
+                if self.ref_model is not None:
+                    _apply_liger_kernel_to_instance(model=self.ref_model)
+            else:
+                raise ImportError(
+                    "You have set `use_liger_kernel` to `True` but liger-kernel >= 0.3.0 is not available. "
+                    "Please install it with `pip install liger-kernel`"
+                )
+
         local_dataloader_batch_size = exact_div(
             args.per_device_train_batch_size * args.gradient_accumulation_steps,
             args.num_generations,
@@ -237,8 +280,7 @@ class FastGRPOTrainer(Trainer):
         )
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
-        self.accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-
+        
         self.train_dataset_len = len(self.train_dataset)
         num_total_samples = int(self.args.num_train_epochs * self.train_dataset_len)
         self.total_steps_per_device = num_total_samples // (
@@ -296,13 +338,17 @@ class FastGRPOTrainer(Trainer):
         self.model, self.optimizer, self.dataloader = self.accelerator.prepare(
             self.model, self.optimizer, self.dataloader
         )
-        self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+        if self.ref_model is not None:
+            self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
         # connect to a remote sglang model
         if self.args.remote_gen_model_url is None:
             self.sglang_job_launcher.wait_for_server()
             self.args.remote_gen_model_url = self.sglang_job_launcher.get_remote_ip()
         self.remote_model = RemoteModel(
-            self.args.remote_gen_model_url, self.args.remote_gen_model_port, self.processing_class.eos_token_id
+            self.args.remote_gen_model_url, 
+            self.args.remote_gen_model_port, 
+            tokenizer=self.processing_class,
+            stop_token_id=self.processing_class.eos_token_id
         )
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: FastGRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
@@ -435,8 +481,23 @@ class FastGRPOTrainer(Trainer):
             start = time.time()
             with tempfile.TemporaryDirectory(dir="/fsx/edward/work/open-r1/data/") as temp_dir_path:
                 unwrapped_model = self.accelerator.unwrap_model(self.model)
+                
+                # 如果是 PEFT 模型，先合并 adapter
+                adapter_was_merged = False
+                if is_peft_model(unwrapped_model):
+                    unwrapped_model.merge_adapter()
+                    adapter_was_merged = True
+                
+                # 保存模型
                 unwrapped_model.save_pretrained(temp_dir_path)
+                
+                # 加载权重到远程模型
                 self.remote_model.load_weights_from_path(temp_dir_path)
+                
+                # 如果之前合并了 adapter，现在取消合并
+                if adapter_was_merged:
+                    unwrapped_model.unmerge_adapter()
+                    
             print("weight sync took: ", time.time() - start)
         self.accelerator.wait_for_everyone()
 
@@ -537,19 +598,34 @@ class FastGRPOTrainer(Trainer):
                 logits_to_keep = torch.tensor(completion_lengths).to(device)
                 logits_to_keep = padded_completion_ids.size(1)
                 with torch.inference_mode():
-                    ref_per_token_logps = self._get_per_token_logps(
-                        self.ref_model, input_ids.to(device), attention_mask.to(device), logits_to_keep
-                    )
+                    # 如果 ref_model 为 None（使用 PEFT 模型的情况），直接使用主模型但禁用 adapter
+                    if self.ref_model is None:
+                        # 先解包模型，以便可以访问 PEFT 特定的方法和属性
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        # 使用上下文管理器临时禁用 adapter
+                        with unwrapped_model.disable_adapter():
+                            # 使用禁用了 adapter 的主模型
+                            ref_per_token_logps = self._get_per_token_logps(
+                                self.model, input_ids.to(device), attention_mask.to(device), logits_to_keep
+                            )
+                    else:
+                        # 正常使用 ref_model
+                        ref_per_token_logps = self._get_per_token_logps(
+                            self.ref_model, input_ids.to(device), attention_mask.to(device), logits_to_keep
+                        )
                 ref_per_token_logps = ref_per_token_logps.to("cpu")    
                 examples["ref_per_token_logps"] = [logprobs[:length] for logprobs, length in zip(ref_per_token_logps, completion_lengths)]
                 
                 return examples
             
             
-            self.ref_model = self.ref_model.to(device)
+            # 只有在 ref_model 不为 None 时才需要把它移动到 device 上
+            if self.ref_model is not None:
+                self.ref_model = self.ref_model.to(device)
             # precompute the ref logprobs and offload the model to cpu
             gen_dataset = gen_dataset.map(compute_ref_logps, batched=True, batch_size=self.args.per_device_train_batch_size)
-            self.ref_model = self.ref_model.to("cpu")
+            if self.ref_model is not None:
+                self.ref_model = self.ref_model.to("cpu")
             
             # we could add some optimizations here like sorting the dataset by length to improve throughput, but we will keep it simple for now
             mini_batch_dataloader = DataLoader(
@@ -641,20 +717,15 @@ class FastGRPOTrainer(Trainer):
         ref_per_token_logps = mini_batch["ref_per_token_logps"]
 
         with self.accelerator.accumulate(self.model):
-            per_token_logps = self._get_per_token_logps(
-                self.model, input_ids, attention_mask, logits_to_keep
-            )
+            
+            per_token_logps = self._get_per_token_logps(self.model, input_ids, attention_mask, logits_to_keep)
             per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps)
-                - (ref_per_token_logps - per_token_logps)
-                - 1
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
 
             advantages = mini_batch["advantages"]
             # TODO: convert to clipped loss so we can multiple GRPO epochs
-            per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(
-                1
-            )
+            per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
             per_token_loss = per_token_loss + self.args.beta * per_token_kl
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 

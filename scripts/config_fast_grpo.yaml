@@ -1,0 +1,82 @@
+# Model arguments
+model_name_or_path: /home/ubuntu/33b_coder/models/merged_model
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+# Data training arguments
+dataset_name: /home/ubuntu/33b_coder/open-r1/RL.jsonl
+dataset_configs:
+- all
+dataset_train_split: train
+num_processes: 6
+ddp_find_unused_parameters: false
+# GRPO trainer config
+# use_vllm: true
+# vllm_device: auto
+# vllm_gpu_memory_utilization: 0.8
+bf16: true
+do_eval: false
+eval_strategy: steps
+eval_steps: 200
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+# hub_model_id: open-r1/DeepSeek-R1-Distill-Qwen-1.5B-v00.00
+# hub_strategy: every_save
+learning_rate: 1.0e-05
+log_level: info
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: cosine
+max_prompt_length: 1024
+max_completion_length: 16384
+temperature: 0.8
+max_steps: -1
+num_train_epochs: 2.0
+num_generations: 8
+output_dir: ./codestral_think
+overwrite_output_dir: true
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 1
+# push_to_hub: true
+beta: 0.04
+
+use_peft: true
+peft_type: lora  # 使用 LoRA
+lora_alpha: 32   # LoRA scaling factor
+lora_dropout: 0.05
+lora_r: 16        # LoRA rank
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+use_rslora: true
+use_dora: true
+
+reward_funcs:
+- accuracy
+- format
+reward_weights:
+- 1.0
+- 0.1
+use_liger_kernel: true
+
+# 禁用wandb日志记录
+report_to:
+- none
+# wandb_entity: huggingface 
+# wandb_project: open-r1
+log_completions: false
+seed: 42
+warmup_ratio: 0.1
+
+# Saving and eval callbacks
+save_strategy: "steps"
+save_steps: 100
+remote_gen_model_url: 127.0.0.1
+remote_gen_model_port: 30000
+remote_gen_model_n_gpus: 2
