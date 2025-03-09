@@ -308,34 +308,19 @@ def main():
         
         for i, example in enumerate(tqdm(split_dataset, desc=f"采样 {split}")):
             prompt = example["prompt"]
-            prompt_text = maybe_apply_chat_template(example, tokenizer)["prompt"]
-            
             # 使用OpenAI API生成样本，支持重试
             completions = None
             for attempt in range(presampling_args.retry_attempts):
                 try:
-                    if is_conversational(example):
-                        # 对话格式，直接使用messages
-                        completions = generate_with_openai_api(
-                            prompt=prompt,
-                            api_base_url=presampling_args.api_base_url,
-                            api_key=presampling_args.api_key,
-                            model_name=presampling_args.model_name_or_path,
-                            num_generations=presampling_args.num_generations,
-                            max_tokens=presampling_args.max_completion_length,
-                            temperature=presampling_args.temperature
-                        )
-                    else:
-                        # 非对话格式，使用文本
-                        completions = generate_with_openai_api(
-                            prompt=prompt_text,
-                            api_base_url=presampling_args.api_base_url,
-                            api_key=presampling_args.api_key,
-                            model_name=presampling_args.model_name_or_path,
-                            num_generations=presampling_args.num_generations,
-                            max_tokens=presampling_args.max_completion_length,
-                            temperature=presampling_args.temperature
-                        )
+                    completions = generate_with_openai_api(
+                        prompt=prompt,
+                        api_base_url=presampling_args.api_base_url,
+                        api_key=presampling_args.api_key,
+                        model_name=presampling_args.model_name_or_path,
+                        num_generations=presampling_args.num_generations,
+                        max_tokens=presampling_args.max_completion_length,
+                        temperature=presampling_args.temperature
+                    )
                     break
                 except Exception as e:
                     if attempt < presampling_args.retry_attempts - 1:
@@ -348,10 +333,7 @@ def main():
             # 格式化生成的文本
             formatted_completions = []
             for completion in completions:
-                if is_conversational(example):
-                    formatted_completion = [{"role": "assistant", "content": completion}]
-                else:
-                    formatted_completion = completion
+                formatted_completion = completion
                 formatted_completions.append(formatted_completion)
             
             # 计算每个生成样本的奖励值
@@ -363,12 +345,6 @@ def main():
                 for i, (reward_func, reward_processing_class) in enumerate(
                     zip(reward_funcs, reward_processing_classes)
                 ):
-                    if is_conversational(example):
-                        messages = {"messages": prompt + [{"role": "assistant", "content": completion[0]["content"]}]}
-                        text = apply_chat_template(messages, tokenizer)["text"] if reward_processing_class else None
-                    else:
-                        text = prompt_text + completion
-                    
                     # 自定义奖励函数
                     reward_kwargs = {key: example[key] for key in example.keys() if key not in ["prompt", "completion"]}
                     reward = reward_func(
@@ -376,7 +352,6 @@ def main():
                         completions=[completion], 
                         **reward_kwargs
                     )[0]
-                    
                     rewards_for_completion.append(reward)
                 
                 all_rewards.append(sum(rewards_for_completion))
